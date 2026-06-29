@@ -3,28 +3,30 @@ python-openhab-test-suite-backend
 ──────────────────────────────────
 Stateless Flask proxy for the python-openhab-test-suite frontend.
 
-Every request carries credentials; no session state is stored.
+Known OpenHABClient behaviour (python-openhab-rest-client):
+  - __login() is called automatically in __init__
+  - There is no public login() method
+  - For myopenhab.org: isCloud=True but isLoggedIn stays False on 401
+    (raise_for_status() throws before self.isLoggedIn = True is reached)
+  - For local OH: isLoggedIn=True on success, False on auth failure
+  - The 401 log lines in the Render console are from failed test connection
+    attempts by the frontend — this is expected behaviour
 
-Key fix vs. previous version:
-  OpenHABClient calls __login() automatically in __init__ — there is
-  NO public login() method. The constructor both creates AND verifies
-  the connection. isLoggedIn and isCloud are set by __init__.
-
-Endpoints
-─────────
-GET  /                 → wake-up / health check
-POST /api/connect      → verify credentials → { loggedIn, isCloud }
-POST /api/test         → run a tester method → { result, output }
+Strategy:
+  - For /api/connect: try the request, treat HTTP 401 as "wrong credentials"
+    (not as "server unreachable"), treat HTTP 2xx/3xx as "loggedIn"
+  - isCloud is detected from the URL, not from the library attribute
 """
 
 import io
-import sys
 import logging
 import os
 
 from contextlib import redirect_stdout, redirect_stderr
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+import requests as req_lib
 
 from openhab import OpenHABClient
 from openhab_test_suite import (
@@ -47,10 +49,7 @@ log = logging.getLogger(__name__)
 def _build_client(body: dict) -> OpenHABClient:
     """
     Build an OpenHABClient from the request body.
-
-    NOTE: OpenHABClient.__init__ calls the private __login() method
-    automatically. There is no public login() method.
-    After construction, check client.isLoggedIn and client.isCloud.
+    The constructor calls __login() automatically.
     """
     url      = (body.get("url") or "").rstrip("/")
     username = body.get("username") or None
@@ -58,8 +57,23 @@ def _build_client(body: dict) -> OpenHABClient:
     token    = body.get("token")    or None
     if not url:
         raise ValueError("url is required")
-    # Constructor handles login automatically
     return OpenHABClient(url=url, username=username, password=password, token=token)
+
+
+def _check_connection(client: OpenHABClient) -> tuple[bool, bool]:
+    """
+    Returns (loggedIn, isCloud).
+
+    The Python library sets isLoggedIn=True only when the /rest endpoint
+    returns 2xx. For myopenhab.org with valid credentials this works.
+    For wrong credentials it returns 401 (raise_for_status throws) so
+    isLoggedIn stays False — which is the correct behaviour.
+
+    isCloud is derived from the URL since the library only sets it
+    for the literal string "https://myopenhab.org".
+    """
+    is_cloud = "myopenhab.org" in (client.url or "")
+    return bool(client.isLoggedIn), is_cloud
 
 
 def _tester_for(name: str, client: OpenHABClient):
@@ -101,35 +115,26 @@ def _capture_and_call(tester, method_name: str, params: list):
 
 @app.route("/", methods=["GET"])
 def health():
-    """Wake-up / health check used by the frontend."""
+    """Wake-up / health check."""
     return jsonify({"status": "ok", "service": "python-openhab-test-suite-backend"}), 200
 
 
 @app.route("/api/connect", methods=["POST"])
 def connect():
     """
-    Verify that the supplied credentials can reach the openHAB server.
+    Verify that the supplied credentials can reach openHAB.
 
-    The OpenHABClient constructor performs the connectivity check
-    automatically — no separate login() call needed or available.
-
-    Request body: { url, username?, password?, token? }
-    Response:     { loggedIn: bool, isCloud: bool }
+    POST body: { url, username?, password?, token? }
+    Response:  { loggedIn: bool, isCloud: bool }
     """
     body = request.get_json(force=True, silent=True) or {}
     try:
-        client = _build_client(body)
-        return jsonify({
-            "loggedIn": bool(client.isLoggedIn),
-            "isCloud":  bool(client.isCloud),
-        })
+        client              = _build_client(body)
+        logged_in, is_cloud = _check_connection(client)
+        return jsonify({"loggedIn": logged_in, "isCloud": is_cloud})
     except Exception as e:
-        log.warning("connect failed: %s", e)
-        return jsonify({
-            "loggedIn": False,
-            "isCloud":  False,
-            "error":    str(e),
-        }), 200
+        log.warning("connect error: %s", e)
+        return jsonify({"loggedIn": False, "isCloud": False, "error": str(e)}), 200
 
 
 @app.route("/api/test", methods=["POST"])
@@ -137,20 +142,15 @@ def run_test():
     """
     Run a single tester method.
 
-    Request body:
+    POST body:
         {
-            url:      string,
-            username: string | null,
-            password: string | null,
-            token:    string | null,
-            tester:   "ItemTester" | "ThingTester" | "RuleTester"
-                    | "ChannelTester" | "PersistenceTester" | "SitemapTester",
-            method:   string,   // e.g. "testSwitch"
-            params:   array     // e.g. ["testSwitch","ON","ON",10]
+            url, username?, password?, token?,
+            tester: str,   // e.g. "ItemTester"
+            method: str,   // e.g. "testSwitch"
+            params: list   // e.g. ["testSwitch","ON","ON",10]
         }
 
-    Response (success):  { result: bool | any, output: string }
-    Response (error):    HTTP 4xx/5xx with { error: string }
+    Response: { result: bool|any, output: str }
     """
     body = request.get_json(force=True, silent=True) or {}
 
@@ -165,38 +165,38 @@ def run_test():
     if not isinstance(params, list):
         return jsonify({"error": "params must be a JSON array"}), 400
 
-    # ── Build client ──────────────────────────────────────────────────────────
-    # Constructor performs login automatically — just check isLoggedIn after.
+    # Build client — constructor performs login automatically
     try:
         client = _build_client(body)
     except Exception as e:
-        log.warning("client creation failed: %s", e)
+        log.warning("client build error: %s", e)
         return jsonify({"error": f"Connection failed: {e}"}), 400
 
-    if not client.isLoggedIn:
+    logged_in, _ = _check_connection(client)
+    if not logged_in:
         return jsonify({
-            "error": "Could not connect to openHAB — check credentials"
+            "error": "Could not connect to openHAB — check URL and credentials"
         }), 401
 
-    # ── Instantiate tester ────────────────────────────────────────────────────
+    # Instantiate tester
     try:
         tester = _tester_for(tester_name, client)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    # ── Validate method ───────────────────────────────────────────────────────
+    # Validate method exists
     if not hasattr(tester, method_name):
         return jsonify({
             "error": f"Method '{method_name}' not found on {tester_name}"
         }), 400
 
-    # ── Execute ───────────────────────────────────────────────────────────────
+    # Execute, capturing all print() output from the tester classes
     try:
         result, output = _capture_and_call(tester, method_name, params)
         log.info("%s.%s(%s) → %s", tester_name, method_name, params, result)
         return jsonify({"result": result, "output": output})
     except TypeError as e:
-        log.warning("type error calling %s.%s: %s", tester_name, method_name, e)
+        log.warning("wrong args %s.%s: %s", tester_name, method_name, e)
         return jsonify({"error": f"Wrong arguments: {e}"}), 400
     except Exception as e:
         log.error("error in %s.%s: %s", tester_name, method_name, e, exc_info=True)
