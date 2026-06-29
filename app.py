@@ -5,6 +5,11 @@ Stateless Flask proxy for the python-openhab-test-suite frontend.
 
 Every request carries credentials; no session state is stored.
 
+Key fix vs. previous version:
+  OpenHABClient calls __login() automatically in __init__ — there is
+  NO public login() method. The constructor both creates AND verifies
+  the connection. isLoggedIn and isCloud are set by __init__.
+
 Endpoints
 ─────────
 GET  /                 → wake-up / health check
@@ -14,7 +19,6 @@ POST /api/test         → run a tester method → { result, output }
 
 import io
 import sys
-import json
 import logging
 import os
 
@@ -40,14 +44,21 @@ log = logging.getLogger(__name__)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _client_from_body(body: dict) -> OpenHABClient:
-    """Build an OpenHABClient from the request body."""
-    url      = body.get("url", "").rstrip("/")
+def _build_client(body: dict) -> OpenHABClient:
+    """
+    Build an OpenHABClient from the request body.
+
+    NOTE: OpenHABClient.__init__ calls the private __login() method
+    automatically. There is no public login() method.
+    After construction, check client.isLoggedIn and client.isCloud.
+    """
+    url      = (body.get("url") or "").rstrip("/")
     username = body.get("username") or None
     password = body.get("password") or None
     token    = body.get("token")    or None
     if not url:
         raise ValueError("url is required")
+    # Constructor handles login automatically
     return OpenHABClient(url=url, username=username, password=password, token=token)
 
 
@@ -63,15 +74,17 @@ def _tester_for(name: str, client: OpenHABClient):
     }
     cls = mapping.get(name)
     if cls is None:
-        raise ValueError(f"Unknown tester: '{name}'")
+        raise ValueError(
+            f"Unknown tester: '{name}'. Valid: "
+            "ItemTester, ThingTester, RuleTester, "
+            "ChannelTester, PersistenceTester, SitemapTester"
+        )
     return cls(client)
 
 
 def _capture_and_call(tester, method_name: str, params: list):
     """
-    Call ``tester.<method_name>(*params)`` while capturing all stdout/stderr
-    output (the tester classes print diagnostic messages).
-
+    Call tester.<method_name>(*params) while capturing stdout/stderr.
     Returns (result, captured_output).
     """
     buf = io.StringIO()
@@ -97,20 +110,26 @@ def connect():
     """
     Verify that the supplied credentials can reach the openHAB server.
 
-    Request body (JSON):
-        { url, username?, password?, token? }
+    The OpenHABClient constructor performs the connectivity check
+    automatically — no separate login() call needed or available.
 
-    Response:
-        { loggedIn: bool, isCloud: bool }
+    Request body: { url, username?, password?, token? }
+    Response:     { loggedIn: bool, isCloud: bool }
     """
     body = request.get_json(force=True, silent=True) or {}
     try:
-        client = _client_from_body(body)
-        client.login()
-        return jsonify({"loggedIn": client.isLoggedIn, "isCloud": client.isCloud})
+        client = _build_client(body)
+        return jsonify({
+            "loggedIn": bool(client.isLoggedIn),
+            "isCloud":  bool(client.isCloud),
+        })
     except Exception as e:
         log.warning("connect failed: %s", e)
-        return jsonify({"loggedIn": False, "isCloud": False, "error": str(e)}), 200
+        return jsonify({
+            "loggedIn": False,
+            "isCloud":  False,
+            "error":    str(e),
+        }), 200
 
 
 @app.route("/api/test", methods=["POST"])
@@ -118,7 +137,7 @@ def run_test():
     """
     Run a single tester method.
 
-    Request body (JSON):
+    Request body:
         {
             url:      string,
             username: string | null,
@@ -126,15 +145,12 @@ def run_test():
             token:    string | null,
             tester:   "ItemTester" | "ThingTester" | "RuleTester"
                     | "ChannelTester" | "PersistenceTester" | "SitemapTester",
-            method:   string,       // e.g. "testSwitch"
-            params:   array         // e.g. ["testSwitch","ON","ON",10]
+            method:   string,   // e.g. "testSwitch"
+            params:   array     // e.g. ["testSwitch","ON","ON",10]
         }
 
-    Response (success):
-        { result: bool | any, output: string }
-
-    Response (error):
-        HTTP 400 / 500 with { error: string }
+    Response (success):  { result: bool | any, output: string }
+    Response (error):    HTTP 4xx/5xx with { error: string }
     """
     body = request.get_json(force=True, silent=True) or {}
 
@@ -142,7 +158,6 @@ def run_test():
     method_name = body.get("method", "")
     params      = body.get("params", [])
 
-    # ── Validate input ────────────────────────────────────────────────────────
     if not tester_name:
         return jsonify({"error": "tester is required"}), 400
     if not method_name:
@@ -151,14 +166,17 @@ def run_test():
         return jsonify({"error": "params must be a JSON array"}), 400
 
     # ── Build client ──────────────────────────────────────────────────────────
+    # Constructor performs login automatically — just check isLoggedIn after.
     try:
-        client = _client_from_body(body)
-        client.login()
-        if not client.isLoggedIn:
-            return jsonify({"error": "Could not connect to openHAB — check credentials"}), 401
+        client = _build_client(body)
     except Exception as e:
         log.warning("client creation failed: %s", e)
         return jsonify({"error": f"Connection failed: {e}"}), 400
+
+    if not client.isLoggedIn:
+        return jsonify({
+            "error": "Could not connect to openHAB — check credentials"
+        }), 401
 
     # ── Instantiate tester ────────────────────────────────────────────────────
     try:
@@ -168,7 +186,9 @@ def run_test():
 
     # ── Validate method ───────────────────────────────────────────────────────
     if not hasattr(tester, method_name):
-        return jsonify({"error": f"Method '{method_name}' not found on {tester_name}"}), 400
+        return jsonify({
+            "error": f"Method '{method_name}' not found on {tester_name}"
+        }), 400
 
     # ── Execute ───────────────────────────────────────────────────────────────
     try:
@@ -176,7 +196,6 @@ def run_test():
         log.info("%s.%s(%s) → %s", tester_name, method_name, params, result)
         return jsonify({"result": result, "output": output})
     except TypeError as e:
-        # Wrong number of arguments
         log.warning("type error calling %s.%s: %s", tester_name, method_name, e)
         return jsonify({"error": f"Wrong arguments: {e}"}), 400
     except Exception as e:
