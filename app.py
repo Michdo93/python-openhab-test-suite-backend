@@ -3,28 +3,24 @@ python-openhab-test-suite-backend
 ──────────────────────────────────
 Stateless Flask proxy for the python-openhab-test-suite frontend.
 
-Key facts about python-openhab-rest-client:
-  1. OpenHABClient.__init__ calls __login() automatically — no public login()
-  2. __login() uses print() for errors (400/401/timeout) → goes to stdout
-  3. isCloud is set only when url == "https://myopenhab.org" (exact match)
-  4. isLoggedIn is True only on HTTP 2xx from /rest
-
-Strategy:
-  - Wrap client construction in redirect_stdout/redirect_stderr so that
-    OpenHABClient's print() calls go into a buffer, not into Render logs
-  - Derive isCloud from the URL ourselves (contains "myopenhab.org")
-  - Return loggedIn=False on any failed login — that is correct behaviour
+Login pattern learned from python-openhab-rest-client-test-app:
+  1. OpenHABClient(url, username, password, token)  — no isLoggedIn check
+  2. UUID(client).getUUID()                         — real API call as verification
+  3. If getUUID() raises → not connected
+  4. If getUUID() returns a string → connected
+  isLoggedIn / isCloud are NOT used — they are unreliable.
 """
 
 import io
 import logging
 import os
+import traceback
 
 from contextlib import redirect_stdout, redirect_stderr
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from openhab import OpenHABClient
+from openhab import OpenHABClient, UUID
 from openhab_test_suite import (
     ItemTester,
     ThingTester,
@@ -36,40 +32,24 @@ from openhab_test_suite import (
 
 # ── Flask ──────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://michdo93.github.io", "http://localhost",
+                   "http://127.0.0.1", "null", "*"])
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+# ── Global client (stateful, same as working test app) ────────────────────────
+_client: OpenHABClient | None = None
+
+
+def _get_client() -> OpenHABClient:
+    if _client is None:
+        raise RuntimeError("Not connected. Call /api/connect first.")
+    return _client
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _build_client_silent(body: dict) -> tuple:
-    """
-    Build an OpenHABClient, suppressing all print() output from __login().
-
-    Returns (client, suppressed_output).
-    The constructor calls __login() automatically — no separate login() exists.
-    """
-    url      = (body.get("url") or "").rstrip("/")
-    username = body.get("username") or None
-    password = body.get("password") or None
-    token    = body.get("token")    or None
-
-    if not url:
-        raise ValueError("url is required")
-
-    buf = io.StringIO()
-    # Suppress the print() calls inside OpenHABClient.__login()
-    with redirect_stdout(buf), redirect_stderr(buf):
-        client = OpenHABClient(
-            url=url, username=username, password=password, token=token
-        )
-    suppressed = buf.getvalue().strip()
-    return client, suppressed
-
-
 def _is_cloud(url: str) -> bool:
-    """More robust cloud detection than the library's exact-string comparison."""
     return "myopenhab.org" in (url or "")
 
 
@@ -92,7 +72,7 @@ def _tester_for(name: str, client: OpenHABClient):
 
 
 def _capture_and_call(tester, method_name: str, params: list):
-    """Call tester.method(*params) while capturing stdout/stderr."""
+    """Call tester.method(*params) while capturing all print() output."""
     buf = io.StringIO()
     try:
         with redirect_stdout(buf), redirect_stderr(buf):
@@ -112,27 +92,65 @@ def health():
 @app.route("/api/connect", methods=["POST"])
 def connect():
     """
-    POST { url, username?, password?, token? }
-    → { loggedIn: bool, isCloud: bool }
+    Pattern from python-openhab-rest-client-test-app:
+      1. Create OpenHABClient
+      2. Call UUID(client).getUUID() as real connectivity verification
+      3. Success → return { loggedIn: true, isCloud, uuid }
+      4. Exception → return { loggedIn: false, error }
+
+    We do NOT check client.isLoggedIn — it is set by __login() which
+    prints 400/401 errors to stdout and is unreliable for cloud connections.
     """
-    body = request.get_json(force=True, silent=True) or {}
+    global _client
+
+    body     = request.get_json(force=True, silent=True) or {}
+    url      = (body.get("url") or "").rstrip("/")
+    username = body.get("username") or None
+    password = body.get("password") or None
+    token    = body.get("token")    or None
+
+    if not url:
+        return jsonify({"loggedIn": False, "error": "url is required"}), 200
+
     try:
-        client, _ = _build_client_silent(body)
+        # Suppress the print() calls from OpenHABClient.__login()
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            _client = OpenHABClient(
+                url=url, username=username, password=password, token=token
+            )
+
+        # Real connectivity check — same as working test app
+        uuid = UUID(_client).getUUID()
+
+        # getUUID returns a string on success, a dict with "error" on failure
+        if isinstance(uuid, dict) and "error" in uuid:
+            _client = None
+            return jsonify({
+                "loggedIn": False,
+                "error":    uuid["error"],
+            }), 200
+
         return jsonify({
-            "loggedIn": bool(client.isLoggedIn),
-            "isCloud":  _is_cloud(body.get("url", "")),
+            "loggedIn": True,
+            "isCloud":  _is_cloud(url),
+            "uuid":     str(uuid),
         })
+
     except Exception as e:
-        log.warning("connect error: %s", e)
-        return jsonify({"loggedIn": False, "isCloud": False, "error": str(e)}), 200
+        _client = None
+        log.warning("connect failed: %s", e)
+        return jsonify({"loggedIn": False, "error": str(e)}), 200
 
 
 @app.route("/api/test", methods=["POST"])
 def run_test():
     """
-    POST { url, username?, password?, token?,
-           tester, method, params }
+    POST { tester, method, params }
     → { result, output }
+
+    Credentials are NOT sent per-request — the global _client is reused.
+    Frontend must call /api/connect first.
     """
     body = request.get_json(force=True, silent=True) or {}
 
@@ -148,14 +166,9 @@ def run_test():
         return jsonify({"error": "params must be a JSON array"}), 400
 
     try:
-        client, _ = _build_client_silent(body)
-    except Exception as e:
-        return jsonify({"error": f"Connection failed: {e}"}), 400
-
-    if not client.isLoggedIn:
-        return jsonify({
-            "error": "Could not connect to openHAB — check URL and credentials"
-        }), 401
+        client = _get_client()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 401
 
     try:
         tester = _tester_for(tester_name, client)
@@ -175,7 +188,7 @@ def run_test():
         return jsonify({"error": f"Wrong arguments: {e}"}), 400
     except Exception as e:
         log.error("%s.%s failed: %s", tester_name, method_name, e, exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
